@@ -10,11 +10,10 @@ python3 courier_promo_bot.py load_promos <file>  — загрузка промо
 python3 courier_promo_bot.py db_stats     — статистика БД
 """
 
-import os, json, logging, re, sys, sqlite3, csv, io, asyncio, fcntl, threading
+import os, json, logging, re, sys, sqlite3, csv, io, fcntl, threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 from pathlib import Path
-from functools import partial
 
 import requests
 from telegram import (
@@ -467,8 +466,7 @@ async def on_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Секунду, ищу тебя в системе...", reply_markup=ReplyKeyboardRemove())
 
     try:
-        loop = asyncio.get_event_loop()
-        cd = await loop.run_in_executor(None, partial(dodo.find_by_phone, pc))
+        cd = dodo.find_by_phone(pc)
     except Exception as e:
         log.error(f"Dodo search: {e}")
         await update.message.reply_text(
@@ -613,9 +611,7 @@ async def h_shifts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not c.get("staff_id"):
         await update.message.reply_text("Не могу найти твой staffId. Напиши управляющему.", reply_markup=menu_kb(u.id in ADMIN_IDS)); return
     await update.message.reply_text("Загружаю твои смены ⏳")
-    try:
-        loop = asyncio.get_event_loop()
-        shifts = await loop.run_in_executor(None, partial(dodo.get_staff_shifts, c["staff_id"], 14))
+    try: shifts = dodo.get_staff_shifts(c["staff_id"], 14)
     except Exception as e:
         log.error(f"Shifts: {e}")
         await update.message.reply_text("Не удалось загрузить. Попробуй позже.", reply_markup=menu_kb(u.id in ADMIN_IDS)); return
@@ -685,8 +681,7 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏳ Проверяю...")
         codes = DB.get_assigned_codes()
         if not codes: await q.message.reply_text("Нет выданных промокодов.", reply_markup=menu_kb(True)); return
-        loop = asyncio.get_event_loop()
-        used = await loop.run_in_executor(None, partial(dodo.find_used_codes, codes, 30))
+        used = dodo.find_used_codes(codes, 30)
         if used:
             for code in used:
                 tg_id, level = DB.mark_used(code)
