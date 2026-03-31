@@ -31,7 +31,7 @@ MAX_TOKEN = "f9LHodD0cOJbBMClbrLrQ4o2rIEuRFNPKZnJfHlEkijHMvyLUqv0Xq3wpR7xBgmwc8p
 MAX_BASE = "https://platform-api.max.ru"
 
 # MAX admin user IDs (MAX user IDs differ from Telegram user IDs — configure separately)
-MAX_ADMIN_IDS: list = []  # e.g. [123456789]
+MAX_ADMIN_IDS: list = [116338333]  # Сергей Головин
 
 # ━━━ LOGGING ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 logging.basicConfig(
@@ -962,7 +962,10 @@ def run_polling():
             updates = result.get("updates") or []
             new_marker = result.get("marker")
 
+            if updates:
+                log.info(f"Received {len(updates)} updates")
             for upd in updates:
+                log.info(f"  -> {upd.get('update_type')} from user {(upd.get('message') or upd.get('callback') or upd.get('user') or {}).get('sender', {}).get('user_id') or (upd.get('user') or {}).get('user_id', '?')}")
                 dispatch_update(upd)
 
             if new_marker is not None:
