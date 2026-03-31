@@ -10,10 +10,11 @@ python3 courier_promo_bot.py load_promos <file>  — загрузка промо
 python3 courier_promo_bot.py db_stats     — статистика БД
 """
 
-import os, json, logging, re, sys, sqlite3, csv, io
+import os, json, logging, re, sys, sqlite3, csv, io, asyncio, fcntl, threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 from pathlib import Path
+from functools import partial
 
 import requests
 from telegram import (
@@ -41,12 +42,17 @@ DEFAULT_PROMO_LEVEL = "70%"
 MSK = timezone(timedelta(hours=3))
 REG_FIO, REG_PHONE, REG_CONFIRM = range(3)
 
+# Logging — only our logger, suppress httpx noise
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-    handlers=[logging.StreamHandler(), logging.FileHandler(str(BASE_DIR / "bot.log"), encoding="utf-8")],
+    level=logging.WARNING,  # global: only warnings+
 )
 log = logging.getLogger("courier_bot")
+log.setLevel(logging.INFO)
+_fh = logging.FileHandler(str(BASE_DIR / "bot.log"), encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_fh)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ━━━ MENUS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BTN_PROMOS = "🏷 Мои промокоды"
@@ -196,29 +202,60 @@ class DB:
 # ━━━ DODO IS API ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 UNITS = {}
 
+# ── Staff cache (TTL 1 hour) ──
+_staff_cache = {"members": [], "ts": 0}
+STAFF_CACHE_TTL = 3600  # seconds
+
 class Dodo:
     BASE = "https://api.dodois.io/dodopizza/ru"
 
     def __init__(self):
         self.tokens = json.load(open(DODO_TOKENS_FILE))
+        self._lock = threading.Lock()
 
     def _save(self, t):
         self.tokens = t
-        with open(DODO_TOKENS_FILE, "w") as f: json.dump(t, f, indent=2)
+        # File lock to prevent concurrent writes from cron scripts
+        fd = os.open(DODO_TOKENS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.write(fd, json.dumps(t, indent=2).encode())
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _load(self):
+        """Reload tokens from file (in case cron updated them)."""
+        try:
+            with open(DODO_TOKENS_FILE) as f:
+                self.tokens = json.load(f)
+        except: pass
 
     def refresh(self):
-        r = requests.post("https://auth.dodois.io/connect/token", data={
-            "grant_type": "refresh_token", "refresh_token": self.tokens["refresh_token"],
-            "client_id": DODO_CLIENT_ID, "client_secret": DODO_CLIENT_SECRET}, timeout=30)
-        if r.status_code != 200: raise Exception(f"Token refresh: {r.status_code}")
-        self._save(r.json())
+        with self._lock:
+            self._load()  # re-read in case another process refreshed
+            r = requests.post("https://auth.dodois.io/connect/token", data={
+                "grant_type": "refresh_token", "refresh_token": self.tokens["refresh_token"],
+                "client_id": DODO_CLIENT_ID, "client_secret": DODO_CLIENT_SECRET}, timeout=30)
+            if r.status_code != 200: raise Exception(f"Token refresh: {r.status_code}")
+            self._save(r.json())
 
     def _h(self): return {"Authorization": f"Bearer {self.tokens['access_token']}"}
 
     def _get(self, ep, params, retry=True):
         r = requests.get(f"{self.BASE}{ep}", headers=self._h(), params=params, timeout=30)
         if r.status_code in (401,403) and retry:
-            self.refresh(); self._update_units()
+            # Re-read tokens from file first (cron may have refreshed them)
+            self._load()
+            r2 = requests.get(f"{self.BASE}{ep}", headers=self._h(), params=params, timeout=30)
+            if r2.status_code not in (401,403):
+                return r2
+            # Still 401 — do full refresh
+            try:
+                self.refresh(); self._update_units()
+            except Exception as e:
+                log.error(f"Token refresh failed: {e}")
+                return r
             return self._get(ep, params, retry=False)
         return r
 
@@ -230,15 +267,23 @@ class Dodo:
             if nu: UNITS.clear(); UNITS.update(nu)
 
     def ensure_units(self):
-        if not UNITS: self.refresh(); self._update_units()
+        if not UNITS:
+            self._load()  # re-read tokens (cron may have refreshed)
+            self._update_units()
+            if not UNITS:  # still empty — need full refresh
+                self.refresh(); self._update_units()
 
-    # ── Поиск сотрудника по телефону через /staff/members ──
-    def find_by_phone(self, phone: str) -> Optional[Dict]:
-        """Ищет сотрудника по телефону. Сначала Active, потом Suspended."""
-        phone10 = re.sub(r"\D", "", phone)[-10:]
+    # ── Кэш сотрудников (TTL 1 час) ──
+    def _refresh_staff_cache(self):
+        """Load all staff members into cache."""
+        import time as _time
+        now = _time.time()
+        if _staff_cache["members"] and (now - _staff_cache["ts"]) < STAFF_CACHE_TTL:
+            return  # cache is fresh
+        log.info("Refreshing staff cache...")
         self.ensure_units()
         all_uids = ",".join(UNITS.keys())
-
+        all_members = []
         for status in ("Active", "Suspended"):
             skip = 0
             while True:
@@ -247,25 +292,35 @@ class Dodo:
                 }, retry=(skip == 0))
                 if r.status_code != 200: break
                 members = r.json().get("members", [])
-                for m in members:
-                    mp = re.sub(r"\D", "", m.get("phoneNumber", ""))[-10:]
-                    if mp == phone10:
-                        return {
-                            "staffId": m.get("id"),
-                            "firstName": m.get("firstName", ""),
-                            "lastName": m.get("lastName", ""),
-                            "patronymic": m.get("patronymicName", ""),
-                            "phone": m.get("phoneNumber", ""),
-                            "inn": m.get("taxpayerIdentificationNumber"),
-                            "unit": m.get("unitName", ""),
-                            "staffType": m.get("staffType", ""),
-                            "position": m.get("positionName", ""),
-                            "employmentType": m.get("employmentTypeName", ""),
-                            "status": m.get("status", ""),
-                            "hiredOn": m.get("hiredOn", ""),
-                        }
+                all_members.extend(members)
                 if r.json().get("isEndOfListReached", True) or len(members) < 100: break
                 skip += len(members)
+        _staff_cache["members"] = all_members
+        _staff_cache["ts"] = now
+        log.info(f"Staff cache loaded: {len(all_members)} members")
+
+    # ── Поиск сотрудника по телефону через кэш ──
+    def find_by_phone(self, phone: str) -> Optional[Dict]:
+        """Ищет сотрудника по телефону. Использует кэш (TTL 1 час)."""
+        phone10 = re.sub(r"\D", "", phone)[-10:]
+        self._refresh_staff_cache()
+        for m in _staff_cache["members"]:
+            mp = re.sub(r"\D", "", m.get("phoneNumber", ""))[-10:]
+            if mp == phone10:
+                return {
+                    "staffId": m.get("id"),
+                    "firstName": m.get("firstName", ""),
+                    "lastName": m.get("lastName", ""),
+                    "patronymic": m.get("patronymicName", ""),
+                    "phone": m.get("phoneNumber", ""),
+                    "inn": m.get("taxpayerIdentificationNumber"),
+                    "unit": m.get("unitName", ""),
+                    "staffType": m.get("staffType", ""),
+                    "position": m.get("positionName", ""),
+                    "employmentType": m.get("employmentTypeName", ""),
+                    "status": m.get("status", ""),
+                    "hiredOn": m.get("hiredOn", ""),
+                }
         return None
 
     def get_courier_shifts(self, date):
@@ -413,7 +468,8 @@ async def on_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Секунду, ищу тебя в системе...", reply_markup=ReplyKeyboardRemove())
 
     try:
-        cd = dodo.find_by_phone(pc)
+        loop = asyncio.get_event_loop()
+        cd = await loop.run_in_executor(None, partial(dodo.find_by_phone, pc))
     except Exception as e:
         log.error(f"Dodo search: {e}")
         await update.message.reply_text(
@@ -558,7 +614,9 @@ async def h_shifts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not c.get("staff_id"):
         await update.message.reply_text("Не могу найти твой staffId. Напиши управляющему.", reply_markup=menu_kb(u.id in ADMIN_IDS)); return
     await update.message.reply_text("Загружаю твои смены ⏳")
-    try: shifts = dodo.get_staff_shifts(c["staff_id"], 14)
+    try:
+        loop = asyncio.get_event_loop()
+        shifts = await loop.run_in_executor(None, partial(dodo.get_staff_shifts, c["staff_id"], 14))
     except Exception as e:
         log.error(f"Shifts: {e}")
         await update.message.reply_text("Не удалось загрузить. Попробуй позже.", reply_markup=menu_kb(u.id in ADMIN_IDS)); return
@@ -628,7 +686,8 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏳ Проверяю...")
         codes = DB.get_assigned_codes()
         if not codes: await q.message.reply_text("Нет выданных промокодов.", reply_markup=menu_kb(True)); return
-        used = dodo.find_used_codes(codes, 30)
+        loop = asyncio.get_event_loop()
+        used = await loop.run_in_executor(None, partial(dodo.find_used_codes, codes, 30))
         if used:
             for code in used:
                 tg_id, level = DB.mark_used(code)
