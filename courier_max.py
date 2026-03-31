@@ -131,20 +131,20 @@ class MaxAPI:
             log.error(f"answer_callback({callback_id}): {e}")
             return False
 
-    def get_updates(self, marker: Optional[int] = None, timeout: int = 30) -> Optional[Dict]:
-        """Long-poll for updates. Returns response JSON or None on error."""
+    def get_updates(self, marker: Optional[int] = None, timeout: int = 5) -> Optional[Dict]:
+        """Long-poll for updates. Short timeout for responsive shutdown."""
         params: Dict[str, Any] = {"timeout": timeout, "limit": 100}
         if marker is not None:
             params["marker"] = marker
         try:
-            r = self.session.get(self._url("/updates"), params=params, timeout=timeout + 10)
+            r = self.session.get(self._url("/updates"), params=params, timeout=timeout + 5)
             if r.status_code == 200:
                 return r.json()
             else:
                 log.error(f"get_updates: {r.status_code} {r.text[:200]}")
                 return None
         except requests.exceptions.Timeout:
-            return None
+            return {"updates": [], "marker": marker}  # empty, not error
         except Exception as e:
             log.error(f"get_updates: {e}")
             return None
@@ -927,6 +927,10 @@ _running = True
 
 def signal_handler(sig, frame):
     global _running
+    if not _running:
+        # Second signal — force exit
+        log.info("Force exit")
+        os._exit(0)
     log.info(f"Signal {sig} received, shutting down...")
     _running = False
 
@@ -950,7 +954,7 @@ def run_polling():
     log.info("Starting long polling loop...")
     while _running:
         try:
-            result = api.get_updates(marker=marker, timeout=30)
+            result = api.get_updates(marker=marker, timeout=5)
             if result is None:
                 consecutive_errors += 1
                 if consecutive_errors > 5:
