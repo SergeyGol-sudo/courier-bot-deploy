@@ -46,6 +46,7 @@ log.addHandler(_fh)
 # ━━━ BUTTON LABELS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BTN_PROMOS   = "🏷 Мои промокоды"
 BTN_SHIFTS   = "📊 Мои смены"
+BTN_RATING   = "⭐ Мой рейтинг"
 BTN_HELP     = "❓ Как это работает"
 BTN_ADMIN    = "🔧 Управление"
 BTN_REGISTER = "📝 Зарегистрироваться"
@@ -207,8 +208,9 @@ def menu_keyboard(is_admin: bool = False) -> list:
         [{"type": "callback", "text": BTN_PROMOS, "payload": "menu_promos"}],
         [
             {"type": "callback", "text": BTN_SHIFTS, "payload": "menu_shifts"},
-            {"type": "callback", "text": BTN_HELP, "payload": "menu_help"},
+            {"type": "callback", "text": BTN_RATING, "payload": "menu_rating"},
         ],
+        [{"type": "callback", "text": BTN_HELP, "payload": "menu_help"}],
     ]
     if is_admin:
         rows.append([{"type": "callback", "text": BTN_ADMIN, "payload": "menu_admin"}])
@@ -585,6 +587,27 @@ def handle_shifts(user_id: int):
     send_menu(user_id, msg, is_max_admin(user_id))
 
 
+def handle_rating(user_id: int):
+    """Show guest rating for the courier."""
+    courier = find_courier_by_max_id(user_id)
+    if not courier:
+        api.send_message(user_id, "Сначала зарегистрируйся 👇", reg_keyboard())
+        return
+    if not courier.get("staff_id"):
+        send_menu(user_id, "Не могу найти твой staffId. Напиши управляющему.", is_max_admin(user_id))
+        return
+    api.send_message(user_id, "Загружаю оценки гостей ⏳")
+    try:
+        from courier_core import get_courier_guest_rating, format_guest_rating
+        shifts = dodo.get_staff_shifts(courier["staff_id"], 60)
+        rating_data = get_courier_guest_rating(courier["staff_id"], shifts)
+        text = "⭐ Оценки гостей\n\n" + format_guest_rating(rating_data)
+    except Exception as e:
+        log.error(f"Rating error: {e}")
+        text = "Не удалось загрузить оценки. Попробуй позже."
+    send_menu(user_id, text, is_max_admin(user_id))
+
+
 def handle_help(user_id: int):
     courier = find_courier_by_max_id(user_id)
     if courier:
@@ -886,6 +909,10 @@ def dispatch_update(update: Dict):
             elif payload == "menu_shifts":
                 api.answer_callback(callback_id, "")
                 handle_shifts(user_id)
+
+            elif payload == "menu_rating":
+                api.answer_callback(callback_id, "")
+                handle_rating(user_id)
 
             elif payload == "menu_help":
                 api.answer_callback(callback_id, "")

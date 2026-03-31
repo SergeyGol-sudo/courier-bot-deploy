@@ -55,11 +55,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ━━━ MENUS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BTN_PROMOS = "🏷 Мои промокоды"
 BTN_SHIFTS = "📊 Мои смены"
+BTN_RATING = "⭐ Мой рейтинг"
 BTN_HELP   = "❓ Как это работает"
 BTN_ADMIN  = "🔧 Управление"
 
 def menu_kb(is_admin=False):
-    rows = [[KeyboardButton(BTN_PROMOS)], [KeyboardButton(BTN_SHIFTS), KeyboardButton(BTN_HELP)]]
+    rows = [[KeyboardButton(BTN_PROMOS)], [KeyboardButton(BTN_SHIFTS), KeyboardButton(BTN_RATING)], [KeyboardButton(BTN_HELP)]]
     if is_admin:
         rows.append([KeyboardButton(BTN_ADMIN)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -626,6 +627,22 @@ async def h_shifts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg += f"\n📈 Итого: {th:.1f} ч, {to} заказов\n\n✅ промокод начислен\n❌ мало часов или заказов"
     await update.message.reply_text(msg, reply_markup=menu_kb(u.id in ADMIN_IDS), parse_mode="Markdown")
 
+async def h_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user; c = DB.find_courier(u.id)
+    if not c: await update.message.reply_text("Сначала зарегистрируйся 👇", reply_markup=reg_kb()); return
+    if not c.get("staff_id"):
+        await update.message.reply_text("Не могу найти твой staffId. Напиши управляющему.", reply_markup=menu_kb(u.id in ADMIN_IDS)); return
+    await update.message.reply_text("Загружаю оценки гостей ⏳")
+    try:
+        from courier_core import get_courier_guest_rating, format_guest_rating
+        shifts = dodo.get_staff_shifts(c["staff_id"], 60)
+        rating_data = get_courier_guest_rating(c["staff_id"], shifts)
+        text = "⭐ Оценки гостей\n\n" + format_guest_rating(rating_data)
+    except Exception as e:
+        log.error(f"Rating: {e}")
+        text = "Не удалось загрузить оценки. Попробуй позже."
+    await update.message.reply_text(text, reply_markup=menu_kb(u.id in ADMIN_IDS), parse_mode="Markdown")
+
 async def h_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; c = DB.find_courier(u.id)
     if c:
@@ -784,6 +801,8 @@ async def h_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await h_promos(update, ctx)
     elif any(w in text for w in ["смен", "работ", "статистик", "shift"]):
         await h_shifts(update, ctx)
+    elif any(w in text for w in ["рейтинг", "оценк", "звезд", "гост", "rating"]):
+        await h_rating(update, ctx)
     elif any(w in text for w in ["помощь", "помоги", "как", "что", "help"]):
         await h_help(update, ctx)
     elif any(w in text for w in ["привет", "здравств", "хай", "hello"]):
@@ -911,6 +930,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_PROMOS)}$"), h_promos))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_SHIFTS)}$"), h_shifts))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_RATING)}$"), h_rating))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), h_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ADMIN)}$"), h_admin))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^adm_"))

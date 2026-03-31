@@ -74,6 +74,27 @@ def init_db():
             ts TEXT, telegram_id INTEGER, fio TEXT, staff_id TEXT,
             code TEXT, level TEXT, unit TEXT, type TEXT
         );
+        CREATE TABLE IF NOT EXISTS feedbacks (
+            order_id TEXT PRIMARY KEY,
+            unit_name TEXT,
+            order_number TEXT,
+            order_date TEXT,
+            rating INTEGER,
+            comment TEXT,
+            feedback_date TEXT,
+            order_type TEXT,
+            delivery_time_min REAL,
+            predicted_time_min REAL,
+            late_min REAL,
+            problematic TEXT,
+            trip_orders INTEGER,
+            courier_staff_id TEXT,
+            courier_fio TEXT,
+            added_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fb_courier ON feedbacks(courier_staff_id);
+        CREATE INDEX IF NOT EXISTS idx_fb_date ON feedbacks(order_date);
+        CREATE INDEX IF NOT EXISTS idx_fb_rating ON feedbacks(rating);
     """)
     conn.commit()
     # Add max_user_id column if it doesn't exist yet (idempotent migration)
@@ -81,7 +102,7 @@ def init_db():
         conn.execute("ALTER TABLE couriers ADD COLUMN max_user_id INTEGER")
         conn.commit()
     except sqlite3.OperationalError:
-        pass  # Column already exists
+        pass
     conn.close()
 
 
@@ -266,6 +287,109 @@ class DB:
         used = c.execute("SELECT COUNT(*) c FROM promo_pool WHERE status='used'").fetchone()["c"]
         c.close()
         return {"couriers": couriers, "total": total, "free": free, "assigned": assigned, "used": used}
+
+    # ── Feedbacks ──
+    @staticmethod
+    def feedback_exists(order_id: str) -> bool:
+        c = get_db()
+        r = c.execute("SELECT 1 FROM feedbacks WHERE order_id=?", (order_id.upper(),)).fetchone()
+        c.close()
+        return r is not None
+
+    @staticmethod
+    def save_feedback(fb: Dict):
+        """Insert or replace a feedback row."""
+        c = get_db()
+        c.execute(
+            "INSERT OR REPLACE INTO feedbacks "
+            "(order_id, unit_name, order_number, order_date, rating, comment, "
+            "feedback_date, order_type, delivery_time_min, predicted_time_min, "
+            "late_min, problematic, trip_orders, courier_staff_id, courier_fio, added_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                fb.get("order_id", "").upper(),
+                fb.get("unit_name", ""),
+                fb.get("order_number", ""),
+                fb.get("order_date", ""),
+                fb.get("rating"),
+                fb.get("comment", ""),
+                fb.get("feedback_date", ""),
+                fb.get("order_type", ""),
+                fb.get("delivery_time_min"),
+                fb.get("predicted_time_min"),
+                fb.get("late_min"),
+                fb.get("problematic", ""),
+                fb.get("trip_orders"),
+                fb.get("courier_staff_id", ""),
+                fb.get("courier_fio", ""),
+                fb.get("added_at", ""),
+            ),
+        )
+        c.commit()
+        c.close()
+
+    @staticmethod
+    def save_feedbacks_batch(feedbacks: List[Dict]):
+        """Batch insert feedbacks."""
+        c = get_db()
+        for fb in feedbacks:
+            c.execute(
+                "INSERT OR IGNORE INTO feedbacks "
+                "(order_id, unit_name, order_number, order_date, rating, comment, "
+                "feedback_date, order_type, delivery_time_min, predicted_time_min, "
+                "late_min, problematic, trip_orders, courier_staff_id, courier_fio, added_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    fb.get("order_id", "").upper(),
+                    fb.get("unit_name", ""),
+                    fb.get("order_number", ""),
+                    fb.get("order_date", ""),
+                    fb.get("rating"),
+                    fb.get("comment", ""),
+                    fb.get("feedback_date", ""),
+                    fb.get("order_type", ""),
+                    fb.get("delivery_time_min"),
+                    fb.get("predicted_time_min"),
+                    fb.get("late_min"),
+                    fb.get("problematic", ""),
+                    fb.get("trip_orders"),
+                    fb.get("courier_staff_id", ""),
+                    fb.get("courier_fio", ""),
+                    fb.get("added_at", ""),
+                ),
+            )
+        c.commit()
+        c.close()
+
+    @staticmethod
+    def get_existing_feedback_ids() -> set:
+        c = get_db()
+        rows = c.execute("SELECT order_id FROM feedbacks").fetchall()
+        c.close()
+        return {r["order_id"] for r in rows}
+
+    @staticmethod
+    def get_courier_feedbacks(courier_staff_id: str, days: int = 60) -> List[Dict]:
+        """Get feedbacks for a specific courier."""
+        cutoff = (datetime.now(MSK) - timedelta(days=days)).strftime("%Y-%m-%d")
+        c = get_db()
+        rows = c.execute(
+            "SELECT * FROM feedbacks WHERE courier_staff_id=? AND order_date>=? ORDER BY order_date DESC",
+            (courier_staff_id, cutoff),
+        ).fetchall()
+        c.close()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def get_courier_feedbacks_by_date(courier_staff_id: str, date: str) -> List[Dict]:
+        """Get feedbacks for a courier on a specific date."""
+        c = get_db()
+        rows = c.execute(
+            "SELECT * FROM feedbacks WHERE courier_staff_id=? AND order_date LIKE ?",
+            (courier_staff_id, f"{date}%"),
+        ).fetchall()
+        c.close()
+        return [dict(r) for r in rows]
 
 
 # ━━━ DODO IS API ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -506,8 +630,156 @@ class Dodo:
         return used
 
 
+    def get_courier_orders(self, staff_id: str, days: int = 30) -> List[Dict]:
+        """Get all delivery orders for a specific courier by staffId."""
+        self.ensure_units()
+        end = datetime.now(MSK)
+        start = end - timedelta(days=days)
+        all_uids = ",".join(UNITS.keys())
+        result = []
+        skip = 0
+        while True:
+            r = self._get(
+                "/delivery/couriers-orders",
+                {
+                    "units": all_uids,
+                    "from": start.strftime("%Y-%m-%dT00:00:00"),
+                    "to": end.strftime("%Y-%m-%dT23:59:59"),
+                    "skip": skip,
+                    "take": 500,
+                },
+                retry=(skip == 0),
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            orders = data.get("couriersOrders", [])
+            for o in orders:
+                if o.get("courierStaffId") == staff_id:
+                    result.append(o)
+            if data.get("isEndOfListReached", True) or len(orders) < 500:
+                break
+            skip += len(orders)
+        return result
+
+
 # Singleton instance — frontends import this
 dodo = Dodo()
+
+
+def get_courier_guest_rating(staff_id: str, shifts: List[Dict]) -> Dict:
+    """Calculate courier's guest rating from SQLite feedbacks."""
+    # Get feedbacks from SQLite
+    fbs = DB.get_courier_feedbacks(staff_id, days=60)
+    if not fbs:
+        return {"last_shift": None, "last_10": None, "all_ratings": []}
+
+    # Group by order_date (shift date)
+    shift_ratings = {}  # date_str → [ratings]
+    all_ratings_list = []
+    for fb in fbs:
+        if fb.get("rating") is None:
+            continue
+        d = (fb.get("order_date") or "")[:10]
+        shift_ratings.setdefault(d, []).append(fb["rating"])
+        all_ratings_list.append((d, fb["rating"], fb.get("comment", "")))
+
+    if not shift_ratings:
+        return {"last_shift": None, "last_10": None, "all_ratings": []}
+
+    # Also include shift dates from actual shifts (even if no ratings)
+    for sh in shifts:
+        sd = (sh.get("clockInAtLocal") or "")[:10]
+        if sd:
+            shift_ratings.setdefault(sd, [])
+
+    sorted_dates = sorted(shift_ratings.keys(), reverse=True)
+
+    # Last shift with ratings
+    last_shift = None
+    for d in sorted_dates:
+        if shift_ratings[d]:
+            rats = shift_ratings[d]
+            last_shift = {
+                "date": d,
+                "avg": round(sum(rats) / len(rats), 1),
+                "count": len(rats),
+                "ratings": rats,
+            }
+            break
+
+    # Last 10 shifts with ratings
+    all_shift_ratings = []
+    shifts_with_ratings = 0
+    for d in sorted_dates:
+        if shift_ratings[d]:
+            all_shift_ratings.extend(shift_ratings[d])
+            shifts_with_ratings += 1
+            if shifts_with_ratings >= 10:
+                break
+
+    last_10 = None
+    if all_shift_ratings:
+        last_10 = {
+            "avg": round(sum(all_shift_ratings) / len(all_shift_ratings), 1),
+            "count": len(all_shift_ratings),
+            "shifts_with_ratings": shifts_with_ratings,
+        }
+
+    return {
+        "last_shift": last_shift,
+        "last_10": last_10,
+        "all_ratings": all_ratings_list[:20],
+    }
+
+
+def format_guest_rating(rating_data: Dict) -> str:
+    """Format guest rating data into a human-readable message."""
+    if not rating_data or (not rating_data.get("last_shift") and not rating_data.get("last_10")):
+        return "Гости пока не оставляли оценок по твоим доставкам."
+
+    lines = []
+
+    ls = rating_data.get("last_shift")
+    if ls:
+        stars = "⭐" * round(ls["avg"])
+        dist = ""
+        for i in range(1, 6):
+            cnt = ls["ratings"].count(i)
+            if cnt:
+                dist += f"  {'⭐' * i} — {cnt}\n"
+        lines.append(
+            f"⭐ *Последняя смена* ({ls['date']})\n"
+            f"   Средняя оценка: *{ls['avg']}*/5 {stars}\n"
+            f"   Оценок: {ls['count']}\n"
+            f"{dist}"
+        )
+
+    l10 = rating_data.get("last_10")
+    if l10:
+        stars10 = "⭐" * round(l10["avg"])
+        lines.append(
+            f"📊 *За {l10['shifts_with_ratings']} смен*\n"
+            f"   Средняя оценка: *{l10['avg']}*/5 {stars10}\n"
+            f"   Всего оценок: {l10['count']}"
+        )
+
+    return "\n".join(lines)
+
+
+def format_nightly_rating(staff_id: str, shift_date: str) -> str:
+    """Get rating text to include in nightly promo notification."""
+    try:
+        fbs = DB.get_courier_feedbacks_by_date(staff_id, shift_date)
+        ratings = [fb["rating"] for fb in fbs if fb.get("rating") is not None]
+        if not ratings:
+            return ""
+        avg = round(sum(ratings) / len(ratings), 1)
+        stars = "⭐" * round(avg)
+        return f"\n\n⭐ Оценки гостей: *{avg}*/5 {stars} ({len(ratings)} оц.)"
+    except Exception as e:
+        log.error(f"Nightly rating error: {e}")
+        return ""
 
 
 # ━━━ NIGHTLY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -558,11 +830,13 @@ def nightly(notify_func: Optional[Callable[[int, str], None]] = None):
         })
         if notify_func:
             try:
+                rating_text = format_nightly_rating(sid, ds)
                 notify_func(
                     c["telegram_id"],
                     f"🎉 Промокод за смену {ds}!\n\n"
                     f"⏱ {hrs:.1f} ч   📦 {ords} заказов\n\n"
-                    f"    🏷  {promo['code']}\n    💰  Скидка {DEFAULT_PROMO_LEVEL}\n\n"
+                    f"    🏷  {promo['code']}\n    💰  Скидка {DEFAULT_PROMO_LEVEL}"
+                    f"{rating_text}\n\n"
                     f"Посмотреть все промокоды → «🏷 Мои промокоды»",
                 )
             except Exception as e:
