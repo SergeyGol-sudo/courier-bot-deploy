@@ -42,17 +42,16 @@ DEFAULT_PROMO_LEVEL = "70%"
 MSK = timezone(timedelta(hours=3))
 REG_FIO, REG_PHONE, REG_CONFIRM = range(3)
 
-# Logging — only our logger, suppress httpx noise
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.WARNING,  # global: only warnings+
-)
+# Logging — single handler, suppress httpx noise
 log = logging.getLogger("courier_bot")
 log.setLevel(logging.INFO)
-_fh = logging.FileHandler(str(BASE_DIR / "bot.log"), encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(_fh)
+log.propagate = False  # prevent duplicate output
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_sh = logging.StreamHandler(); _sh.setFormatter(_fmt)
+_fh = logging.FileHandler(str(BASE_DIR / "bot.log"), encoding="utf-8"); _fh.setFormatter(_fmt)
+log.addHandler(_sh); log.addHandler(_fh)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ━━━ MENUS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BTN_PROMOS = "🏷 Мои промокоды"
