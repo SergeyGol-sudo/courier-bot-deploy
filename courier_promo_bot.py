@@ -668,6 +668,7 @@ async def h_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     await update.message.reply_text("🔧 Управление:", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="adm_stats")],
+        [InlineKeyboardButton("⭐ Рейтинг курьеров", callback_data="adm_rating")],
         [InlineKeyboardButton("🔍 Найти курьера", callback_data="adm_lookup")],
         [InlineKeyboardButton("📥 Загрузить промокоды", callback_data="adm_upload")],
         [InlineKeyboardButton("🔄 Проверить использование", callback_data="adm_check")]]))
@@ -682,6 +683,63 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not st["free"]: msg += "  пусто — нужно загрузить!\n"
         msg += f"\n📋 Всего в пуле: {st['total']}"
         await q.edit_message_text(msg)
+    elif q.data == "adm_rating":
+        await q.edit_message_text("⏳ Собираю рейтинги...")
+        try:
+            all_couriers = DB.get_all_couriers()
+            active = [c for c in all_couriers if c.get("staff_id") and c.get("status") == "Активен"]
+            if not active:
+                await q.message.reply_text("Нет активных курьеров.", reply_markup=menu_kb(True)); return
+            # Get feedbacks from SQLite
+            conn = get_db()
+            rows = conn.execute("""
+                SELECT courier_staff_id, 
+                       COUNT(*) as cnt, 
+                       ROUND(AVG(rating), 1) as avg_rating,
+                       MIN(rating) as min_r,
+                       MAX(rating) as max_r
+                FROM feedbacks 
+                WHERE courier_staff_id != '' AND rating IS NOT NULL
+                AND order_date >= date('now', '-30 days')
+                GROUP BY courier_staff_id
+                ORDER BY avg_rating DESC
+            """).fetchall()
+            conn.close()
+            staff_ratings = {r["courier_staff_id"]: dict(r) for r in rows}
+            
+            lines = ["⭐ Рейтинг курьеров (30 дней)\n"]
+            lines.append(f"{'№':>2}  {'Курьер':<25} {'⭐':>4} {'Оц':>3} {'Пицц':>5}")
+            lines.append("─" * 45)
+            
+            rated = []
+            unrated = []
+            for c in active:
+                sid = c["staff_id"]
+                r = staff_ratings.get(sid)
+                if r and r["cnt"] > 0:
+                    rated.append((c["fio"], r["avg_rating"], r["cnt"], c.get("unit", "")[:5]))
+                else:
+                    unrated.append(c["fio"])
+            
+            rated.sort(key=lambda x: (-x[1], -x[2]))
+            for i, (fio, avg, cnt, unit) in enumerate(rated, 1):
+                stars = "⭐" * round(avg)
+                name = fio[:24]
+                lines.append(f"{i:>2}. {name:<25} {avg:>3.1f} {cnt:>3}  {unit}")
+            
+            if unrated:
+                lines.append(f"\n📭 Без оценок: {len(unrated)} курьеров")
+            
+            lines.append(f"\nВсего: {len(rated)} с оценками, {len(unrated)} без")
+            msg = "\n".join(lines)
+            
+            # Telegram limit 4096 chars
+            if len(msg) > 4000:
+                msg = msg[:3990] + "\n..."
+            await q.message.reply_text(msg, reply_markup=menu_kb(True), parse_mode=None)
+        except Exception as e:
+            log.error(f"Admin rating: {e}")
+            await q.message.reply_text(f"Ошибка: {e}", reply_markup=menu_kb(True))
     elif q.data == "adm_lookup":
         ctx.user_data["adm_lookup"] = True
         await q.edit_message_text("Введи телефон или staffId курьера:")

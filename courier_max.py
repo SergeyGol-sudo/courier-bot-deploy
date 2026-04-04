@@ -239,6 +239,7 @@ def admin_keyboard() -> list:
     """Admin panel keyboard."""
     return make_keyboard([
         [{"type": "callback", "text": "📊 Статистика", "payload": "adm_stats"}],
+        [{"type": "callback", "text": "⭐ Рейтинг курьеров", "payload": "adm_rating"}],
         [{"type": "callback", "text": "🔍 Найти курьера", "payload": "adm_lookup"}],
         [{"type": "callback", "text": "📥 Загрузить промокоды", "payload": "adm_upload"}],
         [{"type": "callback", "text": "🔄 Проверить использование", "payload": "adm_check"}],
@@ -657,6 +658,60 @@ def handle_admin_stats(user_id: int, callback_id: str):
     api.send_message(user_id, msg)
 
 
+def handle_admin_rating(user_id: int, callback_id: str):
+    """Show courier guest ratings."""
+    api.answer_callback(callback_id, "")
+    api.send_message(user_id, "⏳ Собираю рейтинги...")
+    try:
+        all_couriers = DB.get_all_couriers()
+        active = [c for c in all_couriers if c.get("staff_id") and c.get("status") == "Активен"]
+        if not active:
+            send_menu(user_id, "Нет активных курьеров.", True); return
+        from courier_core import get_db
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT courier_staff_id,
+                   COUNT(*) as cnt,
+                   ROUND(AVG(rating), 1) as avg_rating,
+                   MIN(rating) as min_r,
+                   MAX(rating) as max_r
+            FROM feedbacks
+            WHERE courier_staff_id != '' AND rating IS NOT NULL
+            AND order_date >= date('now', '-30 days')
+            GROUP BY courier_staff_id
+            ORDER BY avg_rating DESC
+        """).fetchall()
+        conn.close()
+        staff_ratings = {r["courier_staff_id"]: dict(r) for r in rows}
+
+        lines = ["⭐ Рейтинг курьеров (30 дней)\n"]
+        rated = []
+        unrated = []
+        for c in active:
+            sid = c["staff_id"]
+            r = staff_ratings.get(sid)
+            if r and r["cnt"] > 0:
+                rated.append((c["fio"], r["avg_rating"], r["cnt"], c.get("unit", "")[:5]))
+            else:
+                unrated.append(c["fio"])
+
+        rated.sort(key=lambda x: (-x[1], -x[2]))
+        for i, (fio, avg, cnt, unit) in enumerate(rated, 1):
+            name = fio[:24]
+            lines.append(f"{i:>2}. {name:<25} {avg:>3.1f} ({cnt}оц) {unit}")
+
+        if unrated:
+            lines.append(f"\n📭 Без оценок: {len(unrated)} курьеров")
+        lines.append(f"\nВсего: {len(rated)} с оценками, {len(unrated)} без")
+        msg = "\n".join(lines)
+        if len(msg) > 3900:
+            msg = msg[:3890] + "\n..."
+        send_menu(user_id, msg, True)
+    except Exception as e:
+        log.error(f"Admin rating: {e}")
+        send_menu(user_id, f"Ошибка: {e}", True)
+
+
 def handle_admin_lookup_start(user_id: int, callback_id: str):
     api.answer_callback(callback_id, "")
     set_state(user_id, STATE_ADM_LOOKUP)
@@ -952,6 +1007,8 @@ def dispatch_update(update: Dict):
                 else:
                     api.answer_callback(callback_id, "")
 
+            elif payload == "adm_rating" and is_max_admin(user_id):
+                handle_admin_rating(user_id, callback_id)
             elif payload == "adm_stats" and is_max_admin(user_id):
                 handle_admin_stats(user_id, callback_id)
 
