@@ -855,11 +855,15 @@ def dispatch_update(update: Dict):
                 payload = att.get("payload") or att
                 log.info(f"  att type={att_type} keys={list(payload.keys())}")
                 if att_type in ("contact", "share"):
-                    contact_phone = payload.get("phone_number") or payload.get("vcfPhone") or payload.get("contact_id")
+                    # Try direct fields first
+                    contact_phone = payload.get("phone_number") or payload.get("phone")
+                    # Parse vCard if present
                     if not contact_phone:
-                        # Try nested contact info
-                        ci = payload.get("contact") or payload.get("contactInfo") or {}
-                        contact_phone = ci.get("phone") or ci.get("phoneNumber") or ci.get("phone_number")
+                        vcf = payload.get("vcf_info", "")
+                        if vcf:
+                            m = re.search(r"TEL[^:]*:(\+?[\d]+)", vcf)
+                            if m:
+                                contact_phone = m.group(1)
                     log.info(f"  Contact found: phone={contact_phone}")
                     break
             
