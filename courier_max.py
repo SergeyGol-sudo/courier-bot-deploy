@@ -844,13 +844,32 @@ def dispatch_update(update: Dict):
 
             state = get_state(user_id)
 
+            # Log attachments for debugging
+            if attachments:
+                log.info(f"  Attachments from {user_id}: {json.dumps(attachments, ensure_ascii=False)[:500]}")
+
             # Check for contact sharing
             contact_phone = None
             for att in attachments:
-                if att.get("type") == "contact":
-                    payload = att.get("payload") or {}
-                    contact_phone = payload.get("phone_number") or payload.get("contact_id")
+                att_type = att.get("type", "")
+                payload = att.get("payload") or att
+                log.info(f"  att type={att_type} keys={list(payload.keys())}")
+                if att_type in ("contact", "share"):
+                    contact_phone = payload.get("phone_number") or payload.get("vcfPhone") or payload.get("contact_id")
+                    if not contact_phone:
+                        # Try nested contact info
+                        ci = payload.get("contact") or payload.get("contactInfo") or {}
+                        contact_phone = ci.get("phone") or ci.get("phoneNumber") or ci.get("phone_number")
+                    log.info(f"  Contact found: phone={contact_phone}")
                     break
+            
+            # Also check if the message itself has contact data (some platforms put it at message level)
+            if not contact_phone:
+                msg_contact = message.get("contact") or body.get("contact") or {}
+                if msg_contact:
+                    contact_phone = msg_contact.get("phone") or msg_contact.get("phoneNumber") or msg_contact.get("phone_number")
+                    if contact_phone:
+                        log.info(f"  Contact from message level: phone={contact_phone}")
 
             if contact_phone and state["state"] == STATE_REG_PHONE:
                 handle_reg_contact(user_id, contact_phone)
