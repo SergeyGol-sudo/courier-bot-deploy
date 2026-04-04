@@ -690,50 +690,56 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             active = [c for c in all_couriers if c.get("staff_id") and c.get("status") == "Активен"]
             if not active:
                 await q.message.reply_text("Нет активных курьеров.", reply_markup=menu_kb(True)); return
-            # Get feedbacks from SQLite
             conn = get_db()
             rows = conn.execute("""
-                SELECT courier_staff_id, 
-                       COUNT(*) as cnt, 
+                SELECT courier_staff_id,
+                       COUNT(*) as cnt,
                        ROUND(AVG(rating), 1) as avg_rating,
-                       MIN(rating) as min_r,
-                       MAX(rating) as max_r
-                FROM feedbacks 
+                       SUM(CASE WHEN rating = 5 THEN 1 ELSE 0 END) as r5,
+                       SUM(CASE WHEN rating = 4 THEN 1 ELSE 0 END) as r4,
+                       SUM(CASE WHEN rating <= 3 THEN 1 ELSE 0 END) as r_low
+                FROM feedbacks
                 WHERE courier_staff_id != '' AND rating IS NOT NULL
                 AND order_date >= date('now', '-30 days')
                 GROUP BY courier_staff_id
-                ORDER BY avg_rating DESC
             """).fetchall()
             conn.close()
             staff_ratings = {r["courier_staff_id"]: dict(r) for r in rows}
-            
-            lines = ["⭐ Рейтинг курьеров (30 дней)\n"]
-            lines.append(f"{'№':>2}  {'Курьер':<25} {'⭐':>4} {'Оц':>3} {'Пицц':>5}")
-            lines.append("─" * 45)
-            
+
+            def short_fio(fio):
+                parts = fio.strip().split()
+                if len(parts) >= 3:
+                    return f"{parts[0]} {parts[1]} {parts[2][0]}."
+                elif len(parts) == 2:
+                    return f"{parts[0]} {parts[1]}"
+                return fio
+
             rated = []
             unrated = []
             for c in active:
                 sid = c["staff_id"]
                 r = staff_ratings.get(sid)
                 if r and r["cnt"] > 0:
-                    rated.append((c["fio"], r["avg_rating"], r["cnt"], c.get("unit", "")[:5]))
+                    unit_num = (c.get("unit", "").replace("Череповец-", "Ч") or "")
+                    rated.append((short_fio(c["fio"]), r["avg_rating"], r["cnt"], r["r5"], r["r4"], r["r_low"], unit_num))
                 else:
-                    unrated.append(c["fio"])
-            
+                    unrated.append(short_fio(c["fio"]))
+
             rated.sort(key=lambda x: (-x[1], -x[2]))
-            for i, (fio, avg, cnt, unit) in enumerate(rated, 1):
-                stars = "⭐" * round(avg)
-                name = fio[:24]
-                lines.append(f"{i:>2}. {name:<25} {avg:>3.1f} {cnt:>3}  {unit}")
-            
+
+            lines = ["⭐ Рейтинг курьеров (30 дней)\n"]
+            for i, (fio, avg, cnt, r5, r4, r_low, unit) in enumerate(rated, 1):
+                bar = "⭐" * round(avg) + "☆" * (5 - round(avg))
+                warn = " ⚠️" if r_low > 0 else ""
+                lines.append(f"{i:>2}. {fio}  [{unit}]")
+                lines.append(f"    {bar} {avg}/5 — {cnt}оц (★{r5} ☆{r4} ↓{r_low}){warn}")
+
             if unrated:
-                lines.append(f"\n📭 Без оценок: {len(unrated)} курьеров")
-            
-            lines.append(f"\nВсего: {len(rated)} с оценками, {len(unrated)} без")
+                lines.append(f"\n📭 Без оценок: {len(unrated)}")
+            total_reviews = sum(r[2] for r in rated)
+            avg_all = sum(r[1]*r[2] for r in rated) / total_reviews if total_reviews else 0
+            lines.append(f"\n📊 Итого: {len(rated)} курьеров, {total_reviews} оценок, средний {avg_all:.1f}/5")
             msg = "\n".join(lines)
-            
-            # Telegram limit 4096 chars
             if len(msg) > 4000:
                 msg = msg[:3990] + "\n..."
             await q.message.reply_text(msg, reply_markup=menu_kb(True), parse_mode=None)
