@@ -978,5 +978,201 @@ def main():
         print("Commands: nightly, check_used, load_promos <file>, db_stats")
 
 
+# ━━━ PROMO ORDERS REPORT (Excel) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def generate_promo_orders_report(from_date: str, to_date: str) -> str:
+    """
+    Generate Excel report of courier promo orders.
+    Args: from_date, to_date in YYYY-MM-DD format.
+    Returns: path to generated .xlsx file.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Border, Side
+    from collections import defaultdict
+
+    log.info(f"Generating promo orders report {from_date} — {to_date}")
+
+    # 1. Get all used promos with courier info
+    conn = get_db()
+    promos = conn.execute("""
+        SELECT p.code, p.level, p.used_at, p.assigned_to, c.fio, c.phone, c.unit, c.staff_id
+        FROM promo_pool p
+        LEFT JOIN couriers c ON p.assigned_to = c.telegram_id
+        WHERE p.status = 'used'
+    """).fetchall()
+    conn.close()
+    promo_map = {r["code"].upper(): dict(r) for r in promos}
+    codes_set = set(promo_map.keys())
+
+    if not codes_set:
+        log.warning("No used promos in DB")
+        return ""
+
+    # 2. Scan sales for promo orders
+    dodo.ensure_units()
+    found = {}  # code → order info
+    from_dt = f"{from_date}T00:00:00"
+    to_dt = f"{to_date}T23:59:59"
+
+    for uid in UNITS:
+        skip = 0
+        while True:
+            r = dodo._get("/accounting/sales",
+                {"units": uid, "from": from_dt, "to": to_dt, "skip": skip, "take": 500})
+            if r.status_code != 200: break
+            data = r.json()
+            for s in data.get("sales", []):
+                order_codes = set()
+                products = []
+                total_p = total_d = 0
+                for p in s.get("products", []):
+                    pc = ((p.get("discount") or {}).get("promoCode") or "").upper()
+                    if pc in codes_set: order_codes.add(pc)
+                    products.append(p.get("defaultProductName", ""))
+                    total_p += p.get("price", 0) or 0
+                    total_d += p.get("priceWithDiscount", 0) or 0
+                for pc in order_codes:
+                    found[pc] = {
+                        "order_id": s.get("orderId", ""),
+                        "unit": s.get("unitName", UNITS.get(uid, "")),
+                        "date": s.get("soldAtLocal", "")[:16].replace("T", " "),
+                        "channel": s.get("salesChannel", ""),
+                        "products": ", ".join(products),
+                        "price": total_p, "discount": total_d,
+                    }
+            if data.get("isEndOfListReached", True) or len(data.get("sales", [])) < 500: break
+            skip += len(data.get("sales", []))
+
+    log.info(f"Found {len(found)} promo orders in sales")
+
+    # 3. Get feedbacks
+    conn = get_db()
+    fb_rows = conn.execute(
+        "SELECT order_id, rating, comment FROM feedbacks WHERE order_date >= ? AND order_date <= ?",
+        (from_date, to_date + "Z")
+    ).fetchall()
+    conn.close()
+    fb_map = {r["order_id"].upper(): dict(r) for r in fb_rows}
+
+    # 4. Build rows
+    def short_fio(fio):
+        parts = (fio or "").strip().split()
+        if len(parts) >= 3: return f"{parts[0]} {parts[1]} {parts[2][0]}."
+        elif len(parts) == 2: return f"{parts[0]} {parts[1]}"
+        return fio or "—"
+
+    rows = []
+    for code in sorted(found.keys()):
+        order = found[code]
+        promo = promo_map.get(code, {})
+        fb = fb_map.get(order.get("order_id", "").upper(), {})
+        courier_unit = promo.get("unit", "")
+        order_unit = order["unit"]
+        channel = order["channel"]
+
+        if channel == "Dine-in" and order_unit == courier_unit:
+            who = "Курьер"
+        elif channel == "Dine-in" and order_unit != courier_unit:
+            who = "Друг (др. пиццерия)"
+        elif channel == "Delivery":
+            who = "Доставка"
+        else:
+            who = "?"
+
+        rows.append({
+            "code": code, "fio": short_fio(promo.get("fio")),
+            "phone": promo.get("phone", ""), "courier_unit": courier_unit,
+            "date": order["date"], "order_unit": order_unit,
+            "channel": channel, "products": order["products"],
+            "price": order["price"], "price_disc": order["discount"],
+            "rating": fb.get("rating", ""), "comment": fb.get("comment", ""),
+            "who": who,
+        })
+
+    rows.sort(key=lambda x: x["date"])
+
+    # 5. Excel
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Заказы курьеров"
+
+    hf = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+    hfont = Font(bold=True, color="FFFFFF", size=10)
+    thin = Side(style="thin")
+    brd = Border(top=thin, bottom=thin, left=thin, right=thin)
+
+    headers = ["Промокод", "Курьер", "Телефон", "Пиц. курьера",
+               "Дата заказа", "Пиц. заказа", "Канал",
+               "Состав заказа", "Прайс", "Факт",
+               "Оценка", "Комментарий", "Кто заказал"]
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.font = hfont; c.fill = hf; c.border = brd
+
+    green = PatternFill(start_color="E2EFDA", fill_type="solid")
+    yellow = PatternFill(start_color="FFF2CC", fill_type="solid")
+    blue = PatternFill(start_color="D6E4F0", fill_type="solid")
+
+    for i, row in enumerate(rows, 2):
+        vals = [row["code"], row["fio"], row["phone"], row["courier_unit"],
+                row["date"], row["order_unit"], row["channel"], row["products"],
+                row["price"], row["price_disc"], row["rating"], row["comment"], row["who"]]
+        for col, v in enumerate(vals, 1):
+            c = ws.cell(row=i, column=col, value=v)
+            c.border = brd
+            if col in (9, 10): c.number_format = '#,##0'
+
+        fill = green if "Курьер" == row["who"] else (yellow if "Друг" in row["who"] else (blue if "Доставка" in row["who"] else None))
+        if fill:
+            for col in range(1, 14): ws.cell(row=i, column=col).fill = fill
+
+    # Totals
+    tr = len(rows) + 2
+    ws.cell(row=tr, column=1, value=f"ИТОГО ({len(rows)})").font = Font(bold=True)
+    ws.cell(row=tr, column=9, value=sum(r["price"] for r in rows)).font = Font(bold=True)
+    ws.cell(row=tr, column=9).number_format = '#,##0'
+    ws.cell(row=tr, column=10, value=sum(r["price_disc"] for r in rows)).font = Font(bold=True)
+    ws.cell(row=tr, column=10).number_format = '#,##0'
+
+    widths = [10, 22, 14, 12, 16, 12, 10, 50, 9, 9, 7, 30, 18]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    ws.auto_filter.ref = f"A1:M{len(rows)+1}"
+    ws.freeze_panes = "A2"
+
+    # Summary sheet
+    ws2 = wb.create_sheet("Сводка")
+    ws2["A1"] = f"Промокоды курьеров: {from_date} — {to_date}"
+    ws2["A1"].font = Font(bold=True, size=14)
+
+    total_p = sum(r["price"] for r in rows)
+    total_d = sum(r["price_disc"] for r in rows)
+    courier_self = sum(1 for r in rows if r["who"] == "Курьер")
+    delivery = sum(1 for r in rows if "Доставка" in r["who"])
+    friend = sum(1 for r in rows if "Друг" in r["who"])
+
+    stats = [
+        ("Заказов", len(rows)),
+        ("Прайс итого", f"{total_p:,.0f}₽"),
+        ("Факт (70% скидка)", f"{total_d:,.0f}₽"),
+        ("Скидка итого", f"{total_p - total_d:,.0f}₽"),
+        ("Средний чек (прайс)", f"{total_p // len(rows):,}₽" if rows else "—"),
+        ("Средний чек (факт)", f"{total_d // len(rows):,}₽" if rows else "—"),
+        ("", ""),
+        ("👤 Курьер сам", f"{courier_self} ({courier_self * 100 // len(rows)}%)" if rows else "0"),
+        ("📦 Доставка", f"{delivery} ({delivery * 100 // len(rows)}%)" if rows else "0"),
+        ("👥 Друг", f"{friend} ({friend * 100 // len(rows)}%)" if rows else "0"),
+    ]
+    for i, (k, v) in enumerate(stats, 3):
+        ws2.cell(row=i, column=1, value=k)
+        ws2.cell(row=i, column=2, value=v)
+    ws2.column_dimensions["A"].width = 25
+    ws2.column_dimensions["B"].width = 20
+
+    out = str(BASE_DIR / f"promo_report_{from_date}_{to_date}.xlsx")
+    wb.save(out)
+    log.info(f"Report saved: {out} ({len(rows)} orders)")
+    return out
+
+
 if __name__ == "__main__":
     main()

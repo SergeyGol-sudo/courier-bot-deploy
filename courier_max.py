@@ -243,6 +243,7 @@ def admin_keyboard() -> list:
         [{"type": "callback", "text": "🔍 Найти курьера", "payload": "adm_lookup"}],
         [{"type": "callback", "text": "📥 Загрузить промокоды", "payload": "adm_upload"}],
         [{"type": "callback", "text": "🔄 Проверить использование", "payload": "adm_check"}],
+        [{"type": "callback", "text": "📄 Выгрузка заказов", "payload": "adm_report"}],
     ])
 
 
@@ -726,6 +727,63 @@ def handle_admin_rating(user_id: int, callback_id: str):
         send_menu(user_id, f"Ошибка: {e}", True)
 
 
+def handle_admin_report_menu(user_id: int, callback_id: str):
+    """Show report period selection."""
+    api.answer_callback(callback_id, "")
+    kb = make_keyboard([
+        [{"type": "callback", "text": "🗓 7 дней", "payload": "report_7"}],
+        [{"type": "callback", "text": "🗓 14 дней", "payload": "report_14"}],
+        [{"type": "callback", "text": "🗓 30 дней", "payload": "report_30"}],
+        [{"type": "callback", "text": "🗓 Текущий месяц", "payload": "report_month"}],
+    ])
+    api.send_message(user_id, "📄 Выбери период:", kb)
+
+
+def handle_admin_report_generate(user_id: int, callback_id: str, period: str):
+    """Generate and send promo orders Excel report."""
+    api.answer_callback(callback_id, "")
+    from datetime import datetime as dt, timedelta as td
+    now = dt.now(MSK)
+    if period == "month":
+        from_d = now.replace(day=1).strftime("%Y-%m-%d")
+        to_d = now.strftime("%Y-%m-%d")
+    else:
+        days = int(period)
+        from_d = (now - td(days=days)).strftime("%Y-%m-%d")
+        to_d = now.strftime("%Y-%m-%d")
+
+    api.send_message(user_id, f"⏳ Генерирую отчёт {from_d} — {to_d}...")
+    try:
+        from courier_core import generate_promo_orders_report
+        path = generate_promo_orders_report(from_d, to_d)
+        if path:
+            # Upload file via MAX API
+            with open(path, "rb") as f:
+                upload_r = api.session.post(
+                    f"{MAX_BASE}/uploads",
+                    headers={"Authorization": MAX_TOKEN},
+                    params={"type": "file"},
+                    files={"data": (f"promo_{from_d}_{to_d}.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                    timeout=30,
+                )
+            if upload_r.status_code == 200:
+                token_data = upload_r.json()
+                file_token = token_data.get("token") or token_data.get("fileToken") or ""
+                if file_token:
+                    api.send_message(user_id, f"📄 Заказы по промокодам {from_d} — {to_d}",
+                        [{"type": "file", "payload": {"token": file_token}}])
+                else:
+                    api.send_message(user_id, f"✅ Отчёт сохранён на сервере: {path}")
+            else:
+                log.error(f"MAX upload failed: {upload_r.status_code} {upload_r.text[:200]}")
+                api.send_message(user_id, f"✅ Отчёт сохранён: {path}")
+        else:
+            send_menu(user_id, "Нет данных за этот период.", True)
+    except Exception as e:
+        log.error(f"Report: {e}")
+        send_menu(user_id, f"Ошибка: {e}", True)
+
+
 def handle_admin_lookup_start(user_id: int, callback_id: str):
     api.answer_callback(callback_id, "")
     set_state(user_id, STATE_ADM_LOOKUP)
@@ -1023,6 +1081,11 @@ def dispatch_update(update: Dict):
 
             elif payload == "adm_rating" and is_max_admin(user_id):
                 handle_admin_rating(user_id, callback_id)
+            elif payload == "adm_report" and is_max_admin(user_id):
+                handle_admin_report_menu(user_id, callback_id)
+            elif payload.startswith("report_") and is_max_admin(user_id):
+                period = payload.replace("report_", "")
+                handle_admin_report_generate(user_id, callback_id, period)
             elif payload == "adm_stats" and is_max_admin(user_id):
                 handle_admin_stats(user_id, callback_id)
 

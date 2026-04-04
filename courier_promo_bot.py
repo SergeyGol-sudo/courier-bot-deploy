@@ -671,7 +671,8 @@ async def h_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⭐ Рейтинг курьеров", callback_data="adm_rating")],
         [InlineKeyboardButton("🔍 Найти курьера", callback_data="adm_lookup")],
         [InlineKeyboardButton("📥 Загрузить промокоды", callback_data="adm_upload")],
-        [InlineKeyboardButton("🔄 Проверить использование", callback_data="adm_check")]]))
+        [InlineKeyboardButton("🔄 Проверить использование", callback_data="adm_check")],
+        [InlineKeyboardButton("📄 Выгрузка заказов", callback_data="adm_report")]]))
 
 async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -746,6 +747,40 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Admin rating: {e}")
             await q.message.reply_text(f"Ошибка: {e}", reply_markup=menu_kb(True))
+    elif q.data == "adm_report":
+        await q.edit_message_text("📄 Выбери период:", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗓 Последние 7 дней", callback_data="adm_report_7")],
+            [InlineKeyboardButton("🗓 Последние 14 дней", callback_data="adm_report_14")],
+            [InlineKeyboardButton("🗓 Последние 30 дней", callback_data="adm_report_30")],
+            [InlineKeyboardButton("🗓 Текущий месяц", callback_data="adm_report_month")],
+            [InlineKeyboardButton("✍️ Свой период (дд.мм-дд.мм)", callback_data="adm_report_custom")]]))
+    elif q.data.startswith("adm_report_"):
+        period = q.data.replace("adm_report_", "")
+        if period == "custom":
+            ctx.user_data["adm_report_custom"] = True
+            await q.edit_message_text("Введи период в формате:\n01.04-04.04\nили 2026-04-01 2026-04-04")
+            return
+        now = datetime.now(MSK)
+        if period == "month":
+            from_d = now.replace(day=1).strftime("%Y-%m-%d")
+            to_d = now.strftime("%Y-%m-%d")
+        else:
+            days = int(period)
+            from_d = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+            to_d = now.strftime("%Y-%m-%d")
+        await q.edit_message_text(f"⏳ Генерирую отчёт {from_d} — {to_d}...")
+        try:
+            from courier_core import generate_promo_orders_report
+            path = generate_promo_orders_report(from_d, to_d)
+            if path:
+                await q.message.reply_document(document=open(path, "rb"),
+                    filename=f"promo_orders_{from_d}_{to_d}.xlsx",
+                    caption=f"📄 Заказы по промокодам {from_d} — {to_d}")
+            else:
+                await q.message.reply_text("Нет использованных промокодов за этот период.", reply_markup=menu_kb(True))
+        except Exception as e:
+            log.error(f"Report: {e}")
+            await q.message.reply_text(f"Ошибка: {e}", reply_markup=menu_kb(True))
     elif q.data == "adm_lookup":
         ctx.user_data["adm_lookup"] = True
         await q.edit_message_text("Введи телефон или staffId курьера:")
@@ -810,6 +845,41 @@ async def h_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━ FALLBACKS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def h_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; text = (update.message.text or "").strip().lower()
+
+    # Админ-отчёт (свой период)
+    if ctx.user_data.get("adm_report_custom") and u.id in ADMIN_IDS:
+        ctx.user_data["adm_report_custom"] = False
+        raw = update.message.text.strip()
+        try:
+            now = datetime.now(MSK)
+            year = now.year
+            # Parse formats: "01.04-04.04" or "2026-04-01 2026-04-04"
+            if "-" in raw and "." in raw:
+                parts = raw.split("-")
+                d1 = parts[0].strip().split(".")
+                d2 = parts[1].strip().split(".")
+                from_d = f"{year}-{int(d2[1]):02d}-{int(d1[0]):02d}" if len(d1) == 2 else raw
+                # Actually: dd.mm-dd.mm
+                from_d = f"{year}-{int(d1[1]):02d}-{int(d1[0]):02d}"
+                to_d = f"{year}-{int(d2[1]):02d}-{int(d2[0]):02d}"
+            elif " " in raw:
+                parts = raw.split()
+                from_d, to_d = parts[0], parts[1]
+            else:
+                await update.message.reply_text("Не понял формат. Пример: 01.04-04.04", reply_markup=menu_kb(True)); return
+            await update.message.reply_text(f"⏳ Генерирую отчёт {from_d} — {to_d}...")
+            from courier_core import generate_promo_orders_report
+            path = generate_promo_orders_report(from_d, to_d)
+            if path:
+                await update.message.reply_document(document=open(path, "rb"),
+                    filename=f"promo_orders_{from_d}_{to_d}.xlsx",
+                    caption=f"📄 Заказы по промокодам {from_d} — {to_d}")
+            else:
+                await update.message.reply_text("Нет данных за этот период.", reply_markup=menu_kb(True))
+        except Exception as e:
+            log.error(f"Custom report: {e}")
+            await update.message.reply_text(f"Ошибка: {e}\nФормат: 01.04-04.04", reply_markup=menu_kb(True))
+        return
 
     # Админ-поиск
     if ctx.user_data.get("adm_lookup") and u.id in ADMIN_IDS:
