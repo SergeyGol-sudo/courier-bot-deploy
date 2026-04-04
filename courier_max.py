@@ -433,15 +433,25 @@ def handle_reg_contact(user_id: int, phone: str):
         )
         return
 
-    # Check for duplicates
+    # Check for duplicates — if found, offer to link MAX account
     dup = DB.find_courier_by_phone(pc) or DB.find_courier_by_inn(str(cd["inn"]))
     if dup:
-        set_state(user_id, STATE_IDLE)
-        send_reg(
+        # Auto-link MAX to existing profile
+        log.info(f"Duplicate found: {dup['fio']} (tg={dup['telegram_id']}), linking MAX user {user_id}")
+        DB.set_max_user_id(dup["telegram_id"], user_id)
+        clear_state(user_id)
+        first_name = cd.get("firstName", fio.split()[1] if len(fio.split()) > 1 else fio)
+        send_menu(
             user_id,
-            "Курьер с такими данными уже зарегистрирован в боте.\n\n"
-            "Если это ты — просто нажми «Старт» и всё заработает.\n"
-            "Если кто-то другой — обратись к управляющему.",
+            f"✅ {first_name}, ты уже зарегистрирован!\n"
+            f"Привязал твой аккаунт MAX к профилю.\n"
+            f"Теперь можешь пользоваться ботом и через MAX, и через Telegram 👍",
+            is_max_admin(user_id),
+        )
+        return
+    if False:  # old code removed
+        send_reg(
+            user_id, "",
         )
         return
 
@@ -471,12 +481,53 @@ def handle_reg_confirm(user_id: int, answer: str, callback_id: str):
     fio = state["data"].get("fio", "")
     phone = state["data"].get("phone", "")
     cd = state["data"].get("cd", {})
+    staff_id = cd.get("staffId", "")
 
+    # Check if courier already registered (from TG or previous MAX)
+    existing = None
+    conn = get_db()
+    if staff_id:
+        existing = conn.execute("SELECT * FROM couriers WHERE staff_id=?", (staff_id,)).fetchone()
+    if not existing and phone:
+        phone10 = re.sub(r"\D", "", phone)[-10:]
+        rows = conn.execute("SELECT * FROM couriers").fetchall()
+        for r in rows:
+            rp = re.sub(r"\D", "", r["phone"] or "")[-10:]
+            if rp == phone10:
+                existing = r; break
+    conn.close()
+
+    if existing:
+        # Already registered (probably from Telegram) — just link MAX user_id
+        log.info(f"Linking MAX user {user_id} to existing courier {existing['fio']} (tg={existing['telegram_id']})")
+        try:
+            DB.set_max_user_id(existing["telegram_id"], user_id)
+        except Exception as e:
+            log.error(f"Link MAX: {e}")
+        clear_state(user_id)
+        first_name = fio.split()[1] if len(fio.split()) > 1 else fio.split()[0]
+        # Show existing promos
+        promos = DB.get_courier_promos(existing["telegram_id"])
+        pmsg = ""
+        if promos:
+            pmsg = "\n\n🏷 Твои активные промокоды:\n"
+            for p in promos[:5]:
+                pmsg += f"  🏷 {p['code']} ({p['level']})\n"
+        send_menu(
+            user_id,
+            f"✅ {first_name}, ты уже зарегистрирован!\n"
+            f"Привязал твой аккаунт MAX к профилю.\n"
+            f"Теперь можешь пользоваться ботом и через MAX, и через Telegram 👍{pmsg}",
+            is_max_admin(user_id),
+        )
+        return
+
+    # New courier — register
     try:
         DB.register({
-            "telegram_id": user_id,  # Use MAX user_id as primary key
+            "telegram_id": user_id,
             "fio": fio,
-            "staffId": cd.get("staffId", ""),
+            "staffId": staff_id,
             "unit": cd.get("unit", ""),
             "phone": phone,
             "inn": str(cd.get("inn", "")),
@@ -501,7 +552,7 @@ def handle_reg_confirm(user_id: int, answer: str, callback_id: str):
         DB.log_promo({
             "telegram_id": user_id,
             "fio": fio,
-            "staffId": cd.get("staffId", ""),
+            "staffId": staff_id,
             "code": promo["code"],
             "level": "70%",
             "unit": cd.get("unit", ""),
@@ -535,7 +586,9 @@ def handle_promos(user_id: int):
     if not courier:
         send_reg(user_id, "Сначала зарегистрируйся 👇")
         return
-    promos = DB.get_promos(user_id)
+    # Use telegram_id for promo lookup (promos are assigned to telegram_id)
+    tg_id = courier.get("telegram_id", user_id)
+    promos = DB.get_promos(tg_id)
     if not promos:
         send_menu(
             user_id,
