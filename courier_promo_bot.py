@@ -835,12 +835,22 @@ def nightly():
         agg[sid]["mins"] += (s.get("dayShiftMinutes") or 0)+(s.get("nightShiftMinutes") or 0)
         agg[sid]["orders"] += s.get("deliveredOrdersCount") or 0
     couriers = {c["staff_id"]: c for c in DB.get_all_couriers() if c.get("staff_id")}
-    assigned=skipped=0
+    # Dedup: check who already got a promo for this shift date
+    already = set()
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT fio FROM promo_log WHERE type=?", (f"Смена {ds}",)).fetchall()
+        already = {r["fio"] for r in rows}
+        conn.close()
+    except: pass
+    assigned=skipped=duped=0
     for sid,d in agg.items():
         hrs=d["mins"]/60; ords=d["orders"]
         if hrs<MIN_HOURS or ords<MIN_ORDERS: skipped+=1; continue
         c = couriers.get(sid)
         if not c: continue
+        if c["fio"] in already:
+            duped+=1; continue
         promo = DB.get_free_promo(DEFAULT_PROMO_LEVEL)
         if not promo: log.warning("No free promos"); break
         DB.assign_promo(promo["id"], c["telegram_id"], ds)
@@ -855,9 +865,10 @@ def nightly():
                 "parse_mode": "Markdown"})
         except: pass
         assigned+=1
-    log.info(f"Done: {assigned} assigned, {skipped} skipped")
+    log.info(f"Done: {assigned} assigned, {skipped} skipped, {duped} already had")
     for aid in ADMIN_IDS:
-        try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":aid,"text":f"📊 Ночная проверка {ds}\n👥 {len(agg)} курьеров\n✅ {assigned} промокодов\n⏭ {skipped} пропущено"})
+        dup_line = f"\n♻️ {duped} уже получали" if duped else ""
+        try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":aid,"text":f"📊 Ночная проверка {ds}\n👥 {len(agg)} курьеров\n✅ {assigned} промокодов\n⏭ {skipped} пропущено{dup_line}"})
         except: pass
 
 def check_used():
